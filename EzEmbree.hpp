@@ -22,6 +22,7 @@
 
 #include <embree3/rtcore.h>
 #include "pr.hpp"
+#include <map>
 
 namespace EzEmbree {
 	struct TriangleBufferDescriptor
@@ -140,6 +141,9 @@ namespace EzEmbree {
 			rtcSetGeometryTimeStepCount(instance.get(), 1);
 			rtcCommitGeometry(instance.get());
 			rtcAttachGeometry(_scene.get(), instance.get());
+
+			uint32_t instanceID = _instanceCount++;
+			_nTransform[instanceID] = glm::transpose(glm::inverse(glm::mat3(descriptor.xform)));
 		}
 		void build() {
 			rtcCommitScene(_scene.get());
@@ -179,6 +183,11 @@ namespace EzEmbree {
 			h.primitiveID = rayhit.hit.primID;
 			h.Ng = glm::vec3(rayhit.hit.Ng_x, rayhit.hit.Ng_y, rayhit.hit.Ng_z);
 
+			if (rayhit.hit.instID[0] != RTC_INVALID_GEOMETRY_ID)
+			{
+				h.Ng = _nTransform[rayhit.hit.instID[0]] * h.Ng;
+			}
+
 			h.u = rayhit.hit.u;
 			h.v = rayhit.hit.v;
 
@@ -187,5 +196,8 @@ namespace EzEmbree {
 	private:
 		RTCPtr<RTCDevice> _device;
 		RTCPtr<RTCScene> _scene;
+
+		uint32_t _instanceCount = 0;
+		std::map<uint32_t, glm::mat3> _nTransform;
 	};
 }

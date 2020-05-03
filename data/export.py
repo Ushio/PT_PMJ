@@ -29,6 +29,7 @@ def exportObjGeometry(node):
     }
 
     # 'triangles'
+    # traverse points
     points = []
     for point in rGeom.points():
         p = point.position()
@@ -41,12 +42,12 @@ def exportObjGeometry(node):
     }
     data['Points'] = Points
 
+    # traverse primitives
     skippedPrimitive = 0
-    
     PointNum = [] # for Vertices
     for prim in rGeom.prims():
         if prim.type() != hou.primType.Polygon or prim.numVertices() != 3:
-            hasNonTriangles 
+            skippedPrimitive += 1 
             continue
         
         for vertex in prim.vertices():
@@ -58,7 +59,18 @@ def exportObjGeometry(node):
     data['Vertices'] = Vertices
 
     if skippedPrimitive != 0:
-        print("    {} prims were skipped by some reasons.".format(skippedPrimitive))
+        print("    There are {} invalid prims by some reasons.".format(skippedPrimitive))
+        return
+
+    # Get Primitive Attributes
+    Primitives = {}
+    data['Primitives'] = Primitives
+    for prim in rGeom.primAttribs():
+        # https://www.sidefx.com/docs/houdini/hom/hou/attribData.html
+        if prim.dataType() == hou.attribData.Float:
+            values = rGeom.primFloatAttribValues(prim.name())
+            Primitives[prim.name()] = values
+        print('    PrimAttrib: ' + prim.name())
 
     # output Path
     filePath = os.path.join(hou.expandString("$HIP"), "out", node.name() + '.json')
