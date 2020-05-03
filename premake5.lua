@@ -1,6 +1,6 @@
 include "libs/PrLib"
 
-workspace "SimpleRT"
+workspace "PT_PMJ"
     location "build"
     configurations { "Debug", "Release" }
     startproject "main"

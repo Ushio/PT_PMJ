@@ -5,6 +5,11 @@
 #include <memory>
 
 #include "EzEmbree.hpp"
+#define MAX_ITERATION 64
+
+// Distributing Monte Carlo Errors as a Blue Noise in Screen Space
+// by Permuting Pixel Seeds Between Frames
+#define ENABLE_HEITZ 0
 
 template <int C>
 int nextPowerOf(int M)
@@ -50,6 +55,8 @@ public:
 		if (N == 0)
 		{
 			_random = decltype(_random)(_seed);
+			_shuffuleEngine = std::mt19937(_seed);
+
 			_samples.emplace_back(
 				_random.uniformi() % RANDOM_LENGTH,
 				_random.uniformi() % RANDOM_LENGTH
@@ -75,7 +82,9 @@ public:
 			// PR_ASSERT(std::all_of(xstratum.begin(), xstratum.end(), [](bool b) { return b; }), "");
 			// PR_ASSERT(std::all_of(ystratum.begin(), ystratum.end(), [](bool b) { return b; }), "");
 
-			// printf("generated: %d -> %d\n", N, N * 4);
+			// Important for avoiding dim correlation
+			std::shuffle(_samples.data() + N, _samples.data() + N * 4, _shuffuleEngine);
+
 			N = N * 4;
 		}
 	}
@@ -245,6 +254,7 @@ private:
 private:
 	uint32_t _seed = 1;
 	pr::Xoshiro128StarStar _random;
+	std::mt19937 _shuffuleEngine;
 	std::vector<glm::ivec2> _samples;
 };
 
@@ -389,26 +399,34 @@ public:
 class Sampler {
 public:
 	Sampler() :_seed(0) {
-		_dimOffsetter = pr::Xoshiro128StarStar(_seed);
-		_baseOffset = { _dimOffsetter.uniformf(), _dimOffsetter.uniformf() };
+		_random = pr::Xoshiro128StarStar(_seed);
+		_baseOffset = { _random.uniformf(), _random.uniformf() };
 	}
 	Sampler(int seed) :_seed(seed) {
-		_dimOffsetter = pr::Xoshiro128StarStar(_seed);
-		_baseOffset = { _dimOffsetter.uniformf(), _dimOffsetter.uniformf() };
+		_random = pr::Xoshiro128StarStar(_seed);
+		_baseOffset = { _random.uniformf(), _random.uniformf() };
 	}
 	void clearDimension() {
-		_dimOffsetter = pr::Xoshiro128StarStar(_seed);
-		_baseOffset = { _dimOffsetter.uniformf(), _dimOffsetter.uniformf() };
+		_dim = 0;
 	}
-	glm::vec2 sample(const PMJSequence *pmj, int i) {
-		float x = _dimOffsetter.uniformf();
-		float y = _dimOffsetter.uniformf();
-		auto sample = pmj->samples()[i % pmj->size()];
-		return glm::fract(pmj->to01(sample) + _baseOffset + glm::vec2(x, y));
+	glm::vec2 sample(const std::vector<PMJSequence> &pmjs, int i) {
+		glm::vec2 sample;
+		if (_dim < pmjs.size()) {
+			const PMJSequence &pmj = pmjs[_dim];
+			_dim++;
+			sample = pmj.to01(pmj.samples()[i % pmj.size()]);
+		}
+		else {
+			// fallback
+			sample = { _random.uniformf(), _random.uniformf() };
+		}
+
+		return glm::fract(sample + _baseOffset);
 	}
 	int _seed = 0;
+	int _dim = 0;
 	glm::vec2 _baseOffset;
-	pr::Xoshiro128StarStar _dimOffsetter;
+	pr::Xoshiro128StarStar _random;
 };
 
 
@@ -438,29 +456,38 @@ int main()
 	SetDataDir( JoinPath( ExecutableDir(), "..", "data" ) );
 
 	Config config;
-	config.ScreenWidth = 1280;
-	config.ScreenHeight = 720;
+	config.ScreenWidth = 512;
+	config.ScreenHeight = 512;
 	config.SwapInterval = 1;
 	Initialize( config );
 
 	Camera3D camera;
-	camera.origin = {0, 2.5f, 10};
+	camera.origin = {0, 2.5f, 8};
 	camera.lookat = {0, 2.5f, 0};
 	camera.zUp = false;
 
-	int focusX = 0;
-	int focusY = 0;
+	int focusX = 201;
+	int focusY = 82;
 
 	Scene scene;
 
 	Stopwatch sw;
 	scene.loadGeometry("out/box.json");
-	 //scene.loadGeometry("out/sphere1.json");
+	//scene.loadGeometry("out/sphere1.json");
 	printf( "load: %f ms", sw.elapsed() * 1000.0f );
 	scene.build();
 
-	PMJSequence pmj;
-	pmj.extend(8096);
+	std::vector<PMJSequence> pmjs;
+	pmjs.resize(16);
+	for (int i = 0; i < pmjs.size(); ++i) {
+		pmjs[i].setSeed(i * 10022);
+		pmjs[i].extend(1024);
+	}
+	
+#if ENABLE_HEITZ
+	Image2DMono8 bluenoise;
+	bluenoise.load("bluenoise.png");
+#endif
 
 	pr::ITexture *rtTexture = CreateTexture();
 	int stride = 1;
@@ -469,6 +496,7 @@ int main()
 	struct RayPayload {
 		glm::dvec3 color;
 		int samples = 0;
+		uint32_t seed = 0;
 		Xoshiro128StarStar random;
 		Sampler sampler;
 	};
@@ -510,12 +538,83 @@ int main()
 			for (int i = 0; i < rayPayloads.size(); ++i) {
 				rayPayloads[i].color = glm::vec3(0.0f);
 				rayPayloads[i].samples = 0;
-				rayPayloads[i].random = Xoshiro128StarStar(i + 1);
-				rayPayloads[i].sampler = Sampler(i + 1);
+
+				rayPayloads[i].seed = i + 1;
+				rayPayloads[i].random = Xoshiro128StarStar(rayPayloads[i].seed);
+				rayPayloads[i].sampler = Sampler(rayPayloads[i].seed);
+				// rayPayloads[i].sampler._baseOffset = glm::vec2(0);
 			}
+			iteration = 0;
 		}
 
+		// Heitz
+#if ENABLE_HEITZ
+		if (iteration == MAX_ITERATION)
+		{
+			enum {
+				BLOCK_SIZE = 4
+			};
+			for (int j = 0; j < image.height(); j += BLOCK_SIZE)
+			{
+				for (int i = 0; i < image.width(); i += BLOCK_SIZE)
+				{
+					struct Pixel {
+						int i, j;
+						float value;
+					};
+					struct Bn {
+						int i, j;
+						int value;
+					};
+					int nPixels = 0;
+					Pixel ps[BLOCK_SIZE * BLOCK_SIZE];
+					Bn bns[BLOCK_SIZE * BLOCK_SIZE];
+					for (int k = 0; k < BLOCK_SIZE * BLOCK_SIZE; ++k) {
+						int i_local = k % BLOCK_SIZE;
+						int j_local = k / BLOCK_SIZE;
+						int i_global = i + i_local;
+						int j_global = j + j_local;
+
+						if (image.width() <= i_global || image.height() <= j_global) {
+							continue;
+						}
+						nPixels++;
+
+						ps[k].i = bns[k].i = i_global;
+						ps[k].j = bns[k].j = j_global;
+
+						int rayIndex = j_global * image.width() + i_global;
+						glm::vec3 c = rayPayloads[rayIndex].color;
+						ps[k].value = 0.1226f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+						bns[k].value = bluenoise(i_global % bluenoise.width(), j_global % bluenoise.height());
+					}
+					std::sort(ps, ps + nPixels, [](Pixel a, Pixel b) { return a.value < b.value; });
+					std::sort(bns, bns + nPixels, [](Bn a, Bn b) { return a.value < b.value; });
+
+					RayPayload srcPayloads[BLOCK_SIZE * BLOCK_SIZE];
+					for (int k = 0; k < nPixels; ++k) {
+						int src = ps[k].j * image.width() + ps[k].i;
+						srcPayloads[k] = rayPayloads[src];
+					}
+					for (int k = 0; k < nPixels; ++k) {
+						int dst = bns[k].j * image.width() + bns[k].i;
+						rayPayloads[dst] = srcPayloads[k];
+						rayPayloads[dst].color = glm::vec3(0.0f);
+						rayPayloads[dst].samples = 0;
+						rayPayloads[dst].random = Xoshiro128StarStar(rayPayloads[dst].seed);
+						rayPayloads[dst].sampler = Sampler(rayPayloads[dst].seed);
+					}
+				}
+			}
+		}
+#endif
+
 		CameraRayGenerator rayGenerator(GetCurrentViewMatrix(), GetCurrentProjMatrix(), image.width(), image.height());
+
+		bool skipIteration = false;
+		if (MAX_ITERATION <= rayPayloads[0].samples) {
+			skipIteration = true;
+		}
 
 		ParallelFor(image.height(), [&](int j) {
 			for (int i = 0; i < image.width(); ++i)
@@ -527,16 +626,28 @@ int main()
 					printf("");
 				}
 
+				bool usePMJ = i < (image.width() / 2);
+				// bool usePMJ = false;
+
 				rayPayloads[index].sampler.clearDimension();
-				// glm::vec2 rForShoot = { rayPayloads[index].random.uniformf(), rayPayloads[index].random.uniformf() };
-				glm::vec2 rForShoot = rayPayloads[index].sampler.sample(&pmj, rayPayloads[index].samples);
+				glm::vec2 rForShoot;
+				if( usePMJ )
+				{
+					rForShoot = rayPayloads[index].sampler.sample(pmjs, rayPayloads[index].samples);
+				}
+				else
+				{
+					rForShoot = { rayPayloads[index].random.uniformf(), rayPayloads[index].random.uniformf() };
+				}
+
 				glm::vec3 ro, rd;
 				rayGenerator.shoot(&ro, &rd, i, j, rForShoot.x, rForShoot.y);
 
 				glm::vec3 accumColor = glm::vec3(0.0f);
 
 				glm::vec3 T = glm::vec3(1.0f);
-				for (int depth = 0; depth < 8; ++depth)
+
+				for (int depth = 0; depth < 2; ++depth)
 				{
 					EzEmbree::EmbreeHit hit = scene.embree.intersect(ro, rd);
 					if (hit.hasHit == false) {
@@ -554,38 +665,49 @@ int main()
 					T *= Cd;
 
 					glm::vec3 pHit = ro + rd * hit.t;
+					
+					glm::vec2 rForSample;
+					if (usePMJ)
+					{
+						rForSample = rayPayloads[index].sampler.sample(pmjs, rayPayloads[index].samples);
+					}
+					else
+					{
+						rForSample = { rayPayloads[index].random.uniformf(), rayPayloads[index].random.uniformf() };
+					}
 
-					// glm::vec2 rForSample = rayPayloads[index].sampler.sample(&pmj, rayPayloads[index].samples);
-					glm::vec2 rForSample = { rayPayloads[index].random.uniformf(), rayPayloads[index].random.uniformf() };
 					rd = sampleLambertian(
 						rForSample.x,
 						rForSample.y,
 						Ng
 					);
-					ro = pHit + Ng * 0.001f;
-
-					//glm::vec3 n = glm::normalize(hit.Ng);
-					//accumColor = (n + glm::vec3(1.0f)) * 0.5f;
+					ro = pHit + Ng * 0.0001f;
 				}
 
-				rayPayloads[index].color += accumColor;
-				rayPayloads[index].samples += 1;
+				if (skipIteration == false)
+				{
+					rayPayloads[index].color += accumColor;
+					rayPayloads[index].samples += 1;
+				}
 
 				// update pixels
-				glm::vec3 color = glm::vec3(rayPayloads[index].color) / (float)rayPayloads[index].samples;
-				color.x = std::pow(color.x, 1.0f / 2.2f);
-				color.y = std::pow(color.y, 1.0f / 2.2f);
-				color.z = std::pow(color.z, 1.0f / 2.2f);
-				glm::ivec3 icolor = glm::ivec3( color * 255.0f + glm::vec3(0.5f) );
-				icolor.x = std::min(icolor.x, 255);
-				icolor.y = std::min(icolor.y, 255);
-				icolor.z = std::min(icolor.z, 255);
-				image(i, j) = { icolor.r, icolor.g, icolor.b, 255 };
-
-				if (focus)
+				if (rayPayloads[index].samples != 0)
 				{
-					image(i, j) = { 255, 0, 0, 255 };
+					glm::vec3 color = glm::vec3(rayPayloads[index].color) / (float)rayPayloads[index].samples;
+					color.x = std::pow(color.x, 1.0f / 2.2f);
+					color.y = std::pow(color.y, 1.0f / 2.2f);
+					color.z = std::pow(color.z, 1.0f / 2.2f);
+					glm::ivec3 icolor = glm::ivec3(color * 255.0f + glm::vec3(0.5f));
+					icolor.x = std::min(icolor.x, 255);
+					icolor.y = std::min(icolor.y, 255);
+					icolor.z = std::min(icolor.z, 255);
+					image(i, j) = { icolor.r, icolor.g, icolor.b, 255 };
 				}
+
+				//if (focus)
+				//{
+				//	image(i, j) = { 255, 0, 0, 255 };
+				//}
 			}
 		});
 
@@ -593,54 +715,70 @@ int main()
 
 		// ClearBackground(0, 0, 0, 1);
 		ClearBackground(rtTexture);
+		DrawTextScreen(20, 20, "PMJ");
+		DrawTextScreen(GetScreenWidth() - 90, 20, "Random");
 
 
 		DrawGrid( GridAxis::XZ, 1.0f, 10, {128, 128, 128} );
 		DrawXYZAxis( 1.0f );
 
-		//for (auto polygon : scene.polygons)
-		//{
-		//	BeginCameraWithObjectTransform( camera, polygon->xform );
-		//	PrimBegin( PrimitiveMode::Lines );
-		//	for ( int i = 0; i < polygon->indices.size(); i += 3 )
-		//	{
-		//		int a = polygon->indices[i];
-		//		int b = polygon->indices[i + 1];
-		//		int c = polygon->indices[i + 2];
-		//		glm::u8vec3 color = {255, 255, 255};
-		//		PrimVertex( polygon->P[a], color );
-		//		PrimVertex( polygon->P[b], color );
-		//		PrimVertex( polygon->P[b], color );
-		//		PrimVertex( polygon->P[c], color );
-		//		PrimVertex( polygon->P[c], color );
-		//		PrimVertex( polygon->P[a], color );
-		//	}
-		//	PrimEnd();
-		//	EndCamera();
-		//}
+		static bool showWire = false;
+
+		if (showWire) {
+			for (auto polygon : scene.polygons)
+			{
+				BeginCameraWithObjectTransform(camera, polygon->xform);
+				PrimBegin(PrimitiveMode::Lines);
+				for (int i = 0; i < polygon->indices.size(); i += 3)
+				{
+					int a = polygon->indices[i];
+					int b = polygon->indices[i + 1];
+					int c = polygon->indices[i + 2];
+					glm::u8vec3 color = { 255, 255, 255 };
+					PrimVertex(polygon->P[a], color);
+					PrimVertex(polygon->P[b], color);
+					PrimVertex(polygon->P[b], color);
+					PrimVertex(polygon->P[c], color);
+					PrimVertex(polygon->P[c], color);
+					PrimVertex(polygon->P[a], color);
+				}
+				PrimEnd();
+				EndCamera();
+			}
+		}
 
 		PopGraphicState();
 		EndCamera();
 
 		BeginImGui();
 
-		ImGui::SetNextWindowSize( {500, 800}, ImGuiCond_Once );
+		ImGui::SetNextWindowPos({ 20, 20 }, ImGuiCond_Once);
+		ImGui::SetNextWindowSize( {400, 200}, ImGuiCond_Once );
 		ImGui::Begin( "Panel" );
 		ImGui::Text( "fps = %f", GetFrameRate() );
-		ImGui::Image(rtTexture, ImVec2((float)rtTexture->width(), (float)rtTexture->height()));
 		ImGui::Text("%d spp", rayPayloads[0].samples);
-		ImGui::End();
-
-		int nSample = rayPayloads[0].samples;
-		if (32 <= nSample && __popcnt(rayPayloads[0].samples) == 1)
-		{
+		ImGui::Checkbox("show wire", &showWire);
+		if (ImGui::Button("Save as image_dddddd.png")) {
+			int nSample = rayPayloads[0].samples;
 			char buffer[256];
-			// sprintf(buffer, "rand_%06d.png", nSample);
-			sprintf(buffer, "pmj_%06d.png", nSample);
+			sprintf(buffer, "image_%06d.png", nSample);
 			image.save(buffer);
 		}
+		ImGui::End();
+
+		//int nSample = rayPayloads[0].samples;
+		//if (32 <= nSample && __popcnt(rayPayloads[0].samples) == 1)
+		//{
+		//	char buffer[256];
+		//	sprintf(buffer, "rand_%06d.png", nSample);
+		//	// sprintf(buffer, "pmj_%06d.png", nSample);
+		//	// sprintf(buffer, "heitz_%06d.png", nSample);
+		//	image.save(buffer);
+		//}
 
 		EndImGui();
+
+		iteration++;
 	}
 
 	pr::CleanUp();
