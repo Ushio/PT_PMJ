@@ -6,6 +6,248 @@
 
 #include "EzEmbree.hpp"
 
+template <int C>
+int nextPowerOf(int M)
+{
+	int a = 1;
+	while (a < M)
+	{
+		a *= C;
+	}
+	return a;
+}
+class PMJSequence
+{
+public:
+	// Highly reccommend to use integer for sample. 
+	// We have to avoid numerical error because the stratum check must be strict.
+	enum {
+		RANDOM_MAX = 0x7FFFFF,
+		RANDOM_LENGTH,
+	};
+
+	// this method should be called before first extend. 
+	void setSeed(uint32_t s)
+	{
+		_seed = s;
+	}
+	void clear()
+	{
+		_samples.clear();
+	}
+	const glm::ivec2* samples() const
+	{
+		return _samples.data();
+	}
+	int size() const
+	{
+		return _samples.size();
+	}
+
+	void extend(int M)
+	{
+		int N = _samples.size();
+		if (N == 0)
+		{
+			_random = decltype(_random)(_seed);
+			_samples.emplace_back(
+				_random.uniformi() % RANDOM_LENGTH,
+				_random.uniformi() % RANDOM_LENGTH
+			);
+			N = 1;
+		}
+		_samples.resize(nextPowerOf<4>(M));
+
+		// number of cells
+		// N = 1, 4, 16, 64, 256...
+		while (N < M)
+		{
+			std::vector<bool> xstratum, ystratum;
+			buildOccupied(N, _samples, xstratum, ystratum);
+			extendSequenceDiagonal(N, _samples, _random, xstratum, ystratum);
+			// check whether stratums are filled.
+			// PR_ASSERT(std::all_of(xstratum.begin(), xstratum.end(), [](bool b) { return b; }), "");
+			// PR_ASSERT(std::all_of(ystratum.begin(), ystratum.end(), [](bool b) { return b; }), "");
+
+			buildOccupied(N * 2, _samples, xstratum, ystratum);
+			extendSequenceNonDiagonal(N * 2, _samples, _random, xstratum, ystratum);
+			// check whether stratums are filled.
+			// PR_ASSERT(std::all_of(xstratum.begin(), xstratum.end(), [](bool b) { return b; }), "");
+			// PR_ASSERT(std::all_of(ystratum.begin(), ystratum.end(), [](bool b) { return b; }), "");
+
+			// printf("generated: %d -> %d\n", N, N * 4);
+			N = N * 4;
+		}
+	}
+	glm::vec2 to01(glm::ivec2 s) const
+	{
+		return glm::vec2(s) / glm::vec2(RANDOM_LENGTH);
+	}
+private:
+	/*
+		i, j : cell index
+		xhalf, yhalf: 0 or 1, these indicate the sub-cell
+		n : rows, cols count
+
+		(i,j) cell and sub cell
+		+------------------+------------------+
+		|(xhalf=0, yhalf=0)|(xhalf=1, yhalf=0)|
+		+------------------+------------------+
+		|(xhalf=0, yhalf=0)|(xhalf=1, yhalf=1)|
+		+------------------+------------------+
+	*/
+	static glm::ivec2 generateSamplePoint(int N, int i, int j, int xhalf, int yhalf, int n, pr::IRandomNumberGenerator& random, std::vector<bool>& xstratum, std::vector<bool>& ystratum)
+	{
+		/*
+		 This is the stratum count.
+		 We'll generate [N, Nx2) samples on the current step.
+		 So N stratums are already generated and filled so stratums should be Nx2 and these will be filled on the current step.
+		*/
+		int Nx2 = N * 2;
+
+		int squareLength = (RANDOM_LENGTH / n);
+		int halfSquareLength = squareLength / 2;
+		int stratumLength = (RANDOM_LENGTH / Nx2);
+		int x;
+		for (;;)
+		{
+			x = i * squareLength + xhalf * halfSquareLength + (random.uniformi() % halfSquareLength);
+			int xstratum_index = x / stratumLength;
+			if (xstratum[xstratum_index] == false)
+			{
+				xstratum[xstratum_index] = true;
+				break;
+			}
+		}
+
+		int y;
+		for (;;)
+		{
+			y = j * squareLength + yhalf * halfSquareLength + (random.uniformi() % halfSquareLength);
+			int ystratum_index = y / stratumLength;
+			if (ystratum[ystratum_index] == false)
+			{
+				ystratum[ystratum_index] = true;
+				break;
+			}
+		}
+
+		return {
+			x,
+			y
+		};
+	}
+
+	static void buildOccupied(int N, std::vector<glm::ivec2>& samples, std::vector<bool>& xstratum, std::vector<bool>& ystratum)
+	{
+		/*
+		 This is the stratum count.
+		 We'll generate [N, Nx2) samples on the current step.
+		 So N stratums are already generated and filled so stratums should be Nx2 and these will be filled on the current step.
+		*/
+		int Nx2 = N * 2;
+
+		xstratum.clear();
+		ystratum.clear();
+		xstratum.resize(Nx2);
+		ystratum.resize(Nx2);
+		std::fill(xstratum.begin(), xstratum.end(), false);
+		std::fill(ystratum.begin(), ystratum.end(), false);
+
+		for (int i = 0; i < N; ++i)
+		{
+			int xstratum_index = samples[i].x / (RANDOM_LENGTH / Nx2);
+			int ystratum_index = samples[i].y / (RANDOM_LENGTH / Nx2);
+			xstratum[xstratum_index] = true;
+			ystratum[ystratum_index] = true;
+		}
+	}
+
+	// Generate [N, Nx2) sequence.
+	// samples: sample sequence
+	static void extendSequenceDiagonal(int N, std::vector<glm::ivec2>& samples, pr::IRandomNumberGenerator& random, std::vector<bool>& xstratum, std::vector<bool>& ystratum)
+	{
+		// number of rows, cols
+		// n = 1, 2, 4, 8, 16
+		int n = sqrt(N);
+		for (int s = 0; s < N; ++s)
+		{
+			glm::ivec2 oldpt = samples[s];
+			int squareLength = (RANDOM_LENGTH / n);
+			int i = oldpt.x / squareLength;
+			int j = oldpt.y / squareLength;
+			int i_mod = oldpt.x % squareLength;
+			int j_mod = oldpt.y % squareLength;
+
+			// local sub-square index
+			int xhalf = i_mod < (squareLength / 2) ? 0 : 1;
+			int yhalf = j_mod < (squareLength / 2) ? 0 : 1;
+
+			/* choose a diagonal child cell
+			+-+-+
+			|o| |
+			+-+-+
+			| |x|
+			+-+-+
+
+			o: first cell
+			x: diagonal cell
+			*/
+			xhalf = 1 - xhalf;
+			yhalf = 1 - yhalf;
+			samples[N + s] = generateSamplePoint(N, i, j, xhalf, yhalf, n, random, xstratum, ystratum);
+		}
+	}
+	// Generate [Nx2, Nx3) sequence.
+	static void extendSequenceNonDiagonal(int Nx2, std::vector<glm::ivec2>& samples, pr::IRandomNumberGenerator& random, std::vector<bool>& xstratum, std::vector<bool>& ystratum)
+	{
+		int N = Nx2 / 2;
+		// number of rows, cols
+		// n = 1, 2, 4, 8, 16
+		int n = sqrt(N);
+		for (int s = 0; s < N; ++s)
+		{
+			glm::ivec2 oldpt = samples[s];
+			int squareLength = (RANDOM_LENGTH / n);
+			int i = oldpt.x / squareLength;
+			int j = oldpt.y / squareLength;
+			int i_mod = oldpt.x % squareLength;
+			int j_mod = oldpt.y % squareLength;
+
+			// local sub-square index
+			int xhalf = i_mod < (squareLength / 2) ? 0 : 1;
+			int yhalf = j_mod < (squareLength / 2) ? 0 : 1;
+
+			/* choose a or b
+			+-+-+
+			|o|a|
+			+-+-+
+			|b|o|
+			+-+-+
+			*/
+			if (random.uniformf() < 0.5f)
+			{
+				xhalf = 1 - xhalf;
+			}
+			else
+			{
+				yhalf = 1 - yhalf;
+			}
+
+			samples[N * 2 + s] = generateSamplePoint(Nx2, i, j, xhalf, yhalf, n, random, xstratum, ystratum);
+
+			// b -> a or a -> b
+			xhalf = 1 - xhalf;
+			yhalf = 1 - yhalf;
+			samples[N * 3 + s] = generateSamplePoint(Nx2, i, j, xhalf, yhalf, n, random, xstratum, ystratum);
+		}
+	}
+private:
+	uint32_t _seed = 1;
+	pr::Xoshiro128StarStar _random;
+	std::vector<glm::ivec2> _samples;
+};
+
 struct Polygon
 {
 public:
@@ -144,6 +386,31 @@ public:
 	EzEmbree::Embree embree;
 };
 
+class Sampler {
+public:
+	Sampler() :_seed(0) {
+		_dimOffsetter = pr::Xoshiro128StarStar(_seed);
+		_baseOffset = { _dimOffsetter.uniformf(), _dimOffsetter.uniformf() };
+	}
+	Sampler(int seed) :_seed(seed) {
+		_dimOffsetter = pr::Xoshiro128StarStar(_seed);
+		_baseOffset = { _dimOffsetter.uniformf(), _dimOffsetter.uniformf() };
+	}
+	void clearDimension() {
+		_dimOffsetter = pr::Xoshiro128StarStar(_seed);
+		_baseOffset = { _dimOffsetter.uniformf(), _dimOffsetter.uniformf() };
+	}
+	glm::vec2 sample(const PMJSequence *pmj, int i) {
+		float x = _dimOffsetter.uniformf();
+		float y = _dimOffsetter.uniformf();
+		auto sample = pmj->samples()[i % pmj->size()];
+		return glm::fract(pmj->to01(sample) + _baseOffset + glm::vec2(x, y));
+	}
+	int _seed = 0;
+	glm::vec2 _baseOffset;
+	pr::Xoshiro128StarStar _dimOffsetter;
+};
+
 
 // z up
 static glm::vec3 sampleLambertian(float a, float b, const glm::vec3 &Ng) {
@@ -171,8 +438,8 @@ int main()
 	SetDataDir( JoinPath( ExecutableDir(), "..", "data" ) );
 
 	Config config;
-	config.ScreenWidth = 1920;
-	config.ScreenHeight = 1080;
+	config.ScreenWidth = 1280;
+	config.ScreenHeight = 720;
 	config.SwapInterval = 1;
 	Initialize( config );
 
@@ -192,14 +459,18 @@ int main()
 	printf( "load: %f ms", sw.elapsed() * 1000.0f );
 	scene.build();
 
+	PMJSequence pmj;
+	pmj.extend(8096);
+
 	pr::ITexture *rtTexture = CreateTexture();
-	int stride = 4;
+	int stride = 1;
 
 	int iteration = 0;
 	struct RayPayload {
-		glm::vec3 color;
+		glm::dvec3 color;
 		int samples = 0;
 		Xoshiro128StarStar random;
+		Sampler sampler;
 	};
 	std::vector<RayPayload> rayPayloads;
 
@@ -240,6 +511,7 @@ int main()
 				rayPayloads[i].color = glm::vec3(0.0f);
 				rayPayloads[i].samples = 0;
 				rayPayloads[i].random = Xoshiro128StarStar(i + 1);
+				rayPayloads[i].sampler = Sampler(i + 1);
 			}
 		}
 
@@ -254,13 +526,17 @@ int main()
 				if (focus) {
 					printf("");
 				}
+
+				rayPayloads[index].sampler.clearDimension();
+				// glm::vec2 rForShoot = { rayPayloads[index].random.uniformf(), rayPayloads[index].random.uniformf() };
+				glm::vec2 rForShoot = rayPayloads[index].sampler.sample(&pmj, rayPayloads[index].samples);
 				glm::vec3 ro, rd;
-				rayGenerator.shoot(&ro, &rd, i, j, rayPayloads[index].random.uniformf(), rayPayloads[index].random.uniformf());
+				rayGenerator.shoot(&ro, &rd, i, j, rForShoot.x, rForShoot.y);
 
 				glm::vec3 accumColor = glm::vec3(0.0f);
 
 				glm::vec3 T = glm::vec3(1.0f);
-				for (int depth = 0; depth < 10; ++depth)
+				for (int depth = 0; depth < 8; ++depth)
 				{
 					EzEmbree::EmbreeHit hit = scene.embree.intersect(ro, rd);
 					if (hit.hasHit == false) {
@@ -278,22 +554,25 @@ int main()
 					T *= Cd;
 
 					glm::vec3 pHit = ro + rd * hit.t;
+
+					// glm::vec2 rForSample = rayPayloads[index].sampler.sample(&pmj, rayPayloads[index].samples);
+					glm::vec2 rForSample = { rayPayloads[index].random.uniformf(), rayPayloads[index].random.uniformf() };
 					rd = sampleLambertian(
-						rayPayloads[index].random.uniformf(), 
-						rayPayloads[index].random.uniformf(),
+						rForSample.x,
+						rForSample.y,
 						Ng
 					);
 					ro = pHit + Ng * 0.001f;
 
 					//glm::vec3 n = glm::normalize(hit.Ng);
-						//accumColor = (n + glm::vec3(1.0f)) * 0.5f;
+					//accumColor = (n + glm::vec3(1.0f)) * 0.5f;
 				}
 
 				rayPayloads[index].color += accumColor;
 				rayPayloads[index].samples += 1;
 
 				// update pixels
-				glm::vec3 color = rayPayloads[index].color / (float)rayPayloads[index].samples;
+				glm::vec3 color = glm::vec3(rayPayloads[index].color) / (float)rayPayloads[index].samples;
 				color.x = std::pow(color.x, 1.0f / 2.2f);
 				color.y = std::pow(color.y, 1.0f / 2.2f);
 				color.z = std::pow(color.z, 1.0f / 2.2f);
@@ -349,7 +628,17 @@ int main()
 		ImGui::Begin( "Panel" );
 		ImGui::Text( "fps = %f", GetFrameRate() );
 		ImGui::Image(rtTexture, ImVec2((float)rtTexture->width(), (float)rtTexture->height()));
+		ImGui::Text("%d spp", rayPayloads[0].samples);
 		ImGui::End();
+
+		int nSample = rayPayloads[0].samples;
+		if (32 <= nSample && __popcnt(rayPayloads[0].samples) == 1)
+		{
+			char buffer[256];
+			// sprintf(buffer, "rand_%06d.png", nSample);
+			sprintf(buffer, "pmj_%06d.png", nSample);
+			image.save(buffer);
+		}
 
 		EndImGui();
 	}
